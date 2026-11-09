@@ -5,8 +5,21 @@ Allowed dependencies: numpy, pandas, scikit-learn (and the standard library).
 """
 from __future__ import annotations
 
+import math
+import numpy as np
 import pandas as pd
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    brier_score_loss,
+)
+from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, FunctionTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.dummy import DummyClassifier
 
 TARGET = "failed"
 
@@ -14,22 +27,91 @@ TARGET = "failed"
 # is created). Nothing known only after the delivery attempt, not the label, not the row id.
 # TODO: this is every column of the table. Keep only the ones known at decision time.
 FEATURE_COLUMNS: list[str] = [
-    "parcel_id", "customer_id", "merchant_id", "area", "created_at", "promised_slot",
-    "cod_amount", "n_items", "address_text", "courier_notes", "delivered_at", "failed",
+    "customer_id",
+    "merchant_id",
+    "area",
+    "created_at",
+    "promised_slot",
+    "cod_amount",
+    "n_items",
+    "address_text",
+    "customer_prior_parcels",
+    "customer_prior_fail_rate",
 ]
 
 
 def add_history_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy of df (same index and row order) with two new columns.
+    """Add customer history using only strictly earlier parcels."""
+    result = df.copy()
 
-    Needs customer_id, created_at and failed.
-    - customer_prior_parcels (int): the same customer's parcels with created_at strictly
-      earlier than this row.
-    - customer_prior_fail_rate (float): share of those that failed; NaN when there are none.
-    Parcels with the same timestamp are not prior to each other. The result must not depend
-    on the input row order. Never modify the input.
-    """
-    raise NotImplementedError
+    # Keep track of the original row positions.
+    work = df[["customer_id", "created_at", "failed"]].copy()
+    work["_row_position"] = range(len(work))
+
+    # Group parcels by customer and timestamp.
+    # Parcels with identical timestamps are treated as one group.
+    history = (
+        work.groupby(
+            ["customer_id", "created_at"],
+            dropna=False,
+            sort=True
+        )["failed"]
+        .agg(
+            parcel_count="size",
+            failure_count="sum"
+        )
+        .reset_index()
+    )
+
+    # Calculate cumulative history for each customer.
+    customer_groups = history.groupby(
+        "customer_id",
+        dropna=False,
+        sort=False
+    )
+
+    history["customer_prior_parcels"] = (
+        customer_groups["parcel_count"].cumsum()
+        - history["parcel_count"]
+    )
+
+    prior_failures = (
+        customer_groups["failure_count"].cumsum()
+        - history["failure_count"]
+    )
+
+    # Avoid division by zero for customers with no previous parcels.
+    history["customer_prior_fail_rate"] = (
+        prior_failures
+        / history["customer_prior_parcels"].replace(0, float("nan"))
+    )
+
+    # Attach the history features to the original rows.
+    merged = work.merge(
+        history[
+            [
+                "customer_id",
+                "created_at",
+                "customer_prior_parcels",
+                "customer_prior_fail_rate"
+            ]
+        ],
+        on=["customer_id", "created_at"],
+        how="left",
+        sort=False
+    )
+
+    # Restore the original row order.
+    merged = merged.sort_values("_row_position")
+
+    result["customer_prior_parcels"] = (
+        merged["customer_prior_parcels"].to_numpy()
+    )
+    result["customer_prior_fail_rate"] = (
+        merged["customer_prior_fail_rate"].to_numpy()
+    )
+
+    return result
 
 
 def time_split(df: pd.DataFrame, time_col: str = "created_at",
@@ -40,27 +122,149 @@ def time_split(df: pd.DataFrame, time_col: str = "created_at",
     the boundary is the timestamp of the first of the last n_test rows. Rows at or after the
     boundary are test, rows before it are train.
     """
-    raise NotImplementedError
+
+    if not 0 < test_fraction < 1:
+        raise ValueError("test_fraction must be between 0 and 1")
+
+    n_test = math.ceil(len(df) * test_fraction)
+
+    sorted_df = df.sort_values(time_col)
+
+    boundary = sorted_df.iloc[-n_test:][time_col].min()
+
+    train = sorted_df[sorted_df[time_col] < boundary].copy()
+    test = sorted_df[sorted_df[time_col] >= boundary].copy()
+
+    return train, test
+
+def clean_text(X):
+    """Convert address text into a clean 1D array."""
+    return pd.Series(X).fillna("").astype(str).to_numpy()
 
 
+def extract_datetime_features(X):
+    """Extract useful numerical features from created_at."""
+    dates = pd.to_datetime(X.iloc[:, 0], errors="coerce")
+
+    return np.column_stack([
+        dates.dt.hour,
+        dates.dt.dayofweek,
+        dates.dt.day,
+    ])
 def build_pipeline(seed: int = 0) -> Pipeline:
-    """Return an UNFITTED Pipeline.
+    """Return an unfitted pipeline for predicting parcel failure."""
 
-    Input: a DataFrame with at least FEATURE_COLUMNS plus the two history columns; ignore any
-    other column. The final step must support predict_proba. Must not fail on unseen
-    categories, missing numbers, missing categories or empty address strings. Same seed and
-    same data must give identical predictions.
-    """
-    raise NotImplementedError
+    numeric_features = [
+        "cod_amount",
+        "n_items",
+        "customer_prior_parcels",
+        "customer_prior_fail_rate",
+    ]
+
+    categorical_features = [
+        "customer_id",
+        "merchant_id",
+        "area",
+        "promised_slot",
+    ]
+
+    numeric_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+
+    categorical_pipeline = Pipeline([
+        ("imputer", SimpleImputer(
+            strategy="constant",
+            fill_value="missing"
+        )),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ])
+
+    text_pipeline = Pipeline([
+        ("clean", FunctionTransformer(clean_text, validate=False)),
+        ("tfidf", TfidfVectorizer(
+            ngram_range=(1, 2),
+            min_df=2
+        )),
+    ])
+
+    datetime_pipeline = Pipeline([
+        ("extract", FunctionTransformer(
+            extract_datetime_features,
+            validate=False
+        )),
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("numeric", numeric_pipeline, numeric_features),
+            ("categorical", categorical_pipeline, categorical_features),
+            ("text", text_pipeline, "address_text"),
+            ("datetime", datetime_pipeline, ["created_at"]),
+        ],
+        remainder="drop",
+    )
+
+    model = LogisticRegression(
+        max_iter=1000,
+        random_state=seed
+    )
+
+    return Pipeline([
+        ("preprocessor", preprocessor),
+        ("classifier", model),
+    ])
+
 
 
 def evaluate(model, test_df: pd.DataFrame) -> dict:
-    """{"roc_auc", "pr_auc", "brier", "base_rate", "n"} from model.predict_proba(test_df)[:, 1]
-    against test_df["failed"] (roc_auc_score, average_precision_score, brier_score_loss)."""
-    raise NotImplementedError
+    """Evaluate a trained model using the test dataset."""
+
+    # Get the probability of failure (class 1).
+    predictions = model.predict_proba(test_df[FEATURE_COLUMNS])[:, 1]
+
+    # Get the actual outcomes.
+    actual = test_df[TARGET]
+
+    return {
+        "roc_auc": roc_auc_score(actual, predictions),
+        "pr_auc": average_precision_score(actual, predictions),
+        "brier": brier_score_loss(actual, predictions),
+        "base_rate": actual.mean(),
+        "n": len(test_df),
+    }
 
 
-def compare_to_baseline(train_df: pd.DataFrame, test_df: pd.DataFrame, seed: int = 0) -> dict:
-    """Fit build_pipeline(seed) and DummyClassifier(strategy="prior") on train_df only, evaluate
-    both on test_df, return {"model": {...}, "dummy": {...}, "lift_pr_auc": model - dummy PR-AUC}."""
-    raise NotImplementedError
+
+
+def compare_to_baseline(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    seed: int = 0
+) -> dict:
+    """Compare our model against a simple dummy baseline."""
+
+    # Build and train our machine learning model.
+    model = build_pipeline(seed)
+    model.fit(train_df[FEATURE_COLUMNS], train_df[TARGET])
+
+    # Build and train a simple baseline model.
+    dummy = DummyClassifier(strategy="prior")
+    dummy.fit(train_df[FEATURE_COLUMNS], train_df[TARGET])
+
+    # Evaluate both models on the test data.
+    model_results = evaluate(model, test_df)
+    dummy_results = evaluate(dummy, test_df)
+
+    # Calculate the improvement in PR-AUC.
+    lift_pr_auc = model_results["pr_auc"] - dummy_results["pr_auc"]
+
+    return {
+        "model": model_results,
+        "dummy": dummy_results,
+        "lift_pr_auc": lift_pr_auc,
+    }
+
